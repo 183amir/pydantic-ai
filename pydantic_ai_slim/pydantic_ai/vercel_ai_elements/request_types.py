@@ -7,7 +7,7 @@ Mostly with Claude.
 
 from typing import Annotated, Any, Literal
 
-from pydantic import Discriminator, TypeAdapter
+from pydantic import ConfigDict, Discriminator, TypeAdapter
 
 from ._utils import CamelBaseModel, ProviderMetadata
 
@@ -256,8 +256,7 @@ class SubmitMessage(CamelBaseModel):
     id: str
     messages: list[UIMessage]
 
-    model: str
-    web_search: bool
+    model_config = ConfigDict(extra='allow')
 
 
 class RegenerateMessage(CamelBaseModel):
