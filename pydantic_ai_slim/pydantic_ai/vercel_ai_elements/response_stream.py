@@ -30,6 +30,8 @@ async def sse_stream(agent: Agent[AgentDepsT], user_prompt: str, deps: Any) -> A
         An async iterator text lines to stream over SSE.
     """
     event_streamer = EventStreamer()
+    async for chunk in event_streamer.start():
+        yield chunk.sse()
     async for event in agent.run_stream_events(user_prompt, deps=deps):
         if not isinstance(event, AgentRunResultEvent):
             async for chunk in event_streamer.event_to_chunks(event):
@@ -44,6 +46,35 @@ class EventStreamer:
 
     message_id: str = field(default_factory=lambda: uuid4().hex)
     _final_result_tool_id: str | None = field(default=None, init=False)
+    _current_part_id: str = field(default_factory=lambda: uuid4().hex, init=False)
+    _current_part_type: str | None = field(default=None, init=False)
+    _current_tool_call: messages.ToolCallPart | messages.BuiltinToolCallPart | None = field(default=None, init=False)
+
+    async def start(self) -> AsyncIterator[_t.AbstractSSEChunk]:
+        yield _t.StartChunk(message_id=self.message_id)
+
+    def _new_part(self) -> None:
+        """Generates a new unique ID for a stream part."""
+        self._current_part_id = f'msg_{uuid4().hex}'
+        self._current_part_type = None
+        self._current_tool_call = None
+
+    async def _finish_last_part(self) -> AsyncIterator[_t.AbstractSSEChunk]:
+        """Yields the appropriate end chunk for the last part based on its type."""
+        match self._current_part_type:
+            case 'text':
+                yield _t.TextEndChunk(id=self._current_part_id)
+            case 'reasoning':
+                yield _t.ReasoningEndChunk(id=self._current_part_id)
+            case 'tool' if self._current_tool_call:
+                yield _t.ToolInputAvailableChunk(
+                    tool_call_id=self._current_tool_call.tool_call_id,
+                    tool_name=self._current_tool_call.tool_name,
+                    input=self._current_tool_call.args_as_dict(),
+                )
+            case _:
+                pass
+        self._new_part()
 
     async def event_to_chunks(self, event: messages.AgentStreamEvent) -> AsyncIterator[_t.AbstractSSEChunk]:  # noqa C901
         """Convert pydantic-ai events to Vercel AI Elements events which can be streamed to a client over SSE.
@@ -56,14 +87,20 @@ class EventStreamer:
         """
         match event:
             case messages.PartStartEvent(part=part):
+                # End the previous part if a new one is starting
+                async for chunk in self._finish_last_part():
+                    yield chunk
                 match part:
                     case messages.TextPart(content=content):
-                        yield _t.TextStartChunk(id=self.message_id)
-                        yield _t.TextDeltaChunk(id=self.message_id, delta=content)
+                        self._current_part_type = 'text'
+                        yield _t.TextStartChunk(id=self._current_part_id)
+                        yield _t.TextDeltaChunk(id=self._current_part_id, delta=content)
                     case (
                         messages.ToolCallPart(tool_name=tool_name, tool_call_id=tool_call_id, args=args)
                         | messages.BuiltinToolCallPart(tool_name=tool_name, tool_call_id=tool_call_id, args=args)
                     ):
+                        self._current_part_type = 'tool'
+                        self._current_tool_call = part
                         yield _t.ToolInputStartChunk(tool_call_id=tool_call_id, tool_name=tool_name)
                         if isinstance(args, str):
                             yield _t.ToolInputDeltaChunk(tool_call_id=tool_call_id, input_text_delta=args)
@@ -78,16 +115,17 @@ class EventStreamer:
                         yield _t.ToolOutputAvailableChunk(tool_call_id=tool_call_id, output=content)
 
                     case messages.ThinkingPart(content=content):
-                        yield _t.ReasoningStartChunk(id=self.message_id)
-                        yield _t.ReasoningDeltaChunk(id=self.message_id, delta=content)
+                        self._current_part_type = 'reasoning'
+                        yield _t.ReasoningStartChunk(id=self._current_part_id)
+                        yield _t.ReasoningDeltaChunk(id=self._current_part_id, delta=content)
 
             case messages.PartDeltaEvent(delta=delta):
                 match delta:
                     case messages.TextPartDelta(content_delta=content_delta):
-                        yield _t.TextDeltaChunk(id=self.message_id, delta=content_delta)
+                        yield _t.TextDeltaChunk(id=self._current_part_id, delta=content_delta)
                     case messages.ThinkingPartDelta(content_delta=content_delta):
                         if content_delta:
-                            yield _t.ReasoningDeltaChunk(id=self.message_id, delta=content_delta)
+                            yield _t.ReasoningDeltaChunk(id=self._current_part_id, delta=content_delta)
                     case messages.ToolCallPartDelta(args_delta=args, tool_call_id=tool_call_id):
                         tool_call_id = tool_call_id or ''
                         if isinstance(args, str):
@@ -125,6 +163,8 @@ class EventStreamer:
         """Send extra messages required to close off the stream."""
         if tool_call_id := self._final_result_tool_id:
             yield _t.ToolOutputAvailableChunk(tool_call_id=tool_call_id, output=None)
+        async for chunk in self._finish_last_part():
+            yield chunk
         yield _t.FinishChunk()
         yield DoneChunk()
 
